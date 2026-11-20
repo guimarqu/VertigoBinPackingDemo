@@ -3,16 +3,50 @@
 Root column generation for bin packing with
 [Vertigo.jl](https://github.com/nablarise/Vertigo.jl), on the Falkenauer
 instances of [BPPLIB](https://github.com/mdelorme2/BPPLIB). The same
-decomposition is built two ways, and the script fails if they disagree:
+decomposition is built three ways, and the script fails if they disagree:
 
+- **Compact** (`identical.jl`): the compact model of one bin, indexed by a set
+  of identical blocks, decomposed by `@dantzig_wolfe`. This is the modelling
+  proposed in Vertigo.jl#137; it lives here until Vertigo has it.
 - **Patterns** (`patterns.jl`): the master is written in plain JuMP over
-  families of patterns. This is the modelling proposed in Vertigo.jl#124; it
-  lives here until Vertigo has it.
+  families of patterns, as proposed in Vertigo.jl#124, now on hold in favour of
+  the compact one.
 - **By hand** (`hand_built_decomposition` in `binpacking.jl`): the master and
   the pricing subproblem are fed to `DWReformulationBuilder` directly. This is
-  the reference for the first.
+  the reference for the other two.
 
 Only the root is solved. See the known limits below for why.
+
+## The compact formulation
+
+```julia
+K = identical(:bins, nb_bins)          # one element k̂, between 0 and nb_bins copies
+
+@variable(model, x[k in K, i in items], Bin)
+@variable(model, y[k in K], Bin)
+@constraint(model, knapsack[k in K], sum(w[i] * x[k, i] for i in items) <= C * y[k])
+@constraint(model, cover[i in items], sum(x[k, i] for k in K) >= 1)
+@objective(model, Min, sum(1.0 * y[k] for k in K))
+
+decomp, sp_map = @dantzig_wolfe model begin
+    x[k, _] => subproblem(k)
+    y[k] => subproblem(k)
+    knapsack[k] => subproblem(k)
+    cover[_] => master()
+end
+apply_multiplicities!(decomp, sp_map)
+```
+
+- `K` has one element, which stands for every bin. The model describes one
+  representative bin, and `x[k̂, i]` reads as the number of bins holding item
+  `i`. JuMP itself sees one bin only: `optimize!(model)` does not solve the
+  problem.
+- `subproblem(k)` receives that element, which carries the bounds on the number
+  of bins. Every annotation of the subproblem gets the same element, so they
+  agree on it.
+- `apply_multiplicities!` writes those bounds into the decomposition and the
+  master, because the DML gives every subproblem `(1, 1)` for now.
+- A bin costs its variable `y[k̂]`, so the subproblem has no fixed cost.
 
 ## The pattern formulation
 
@@ -82,15 +116,18 @@ time.
 
 ## Results
 
-Root column generation on an Apple M3 Pro, Julia 1.12. Both formulations give
-the same values, to every printed digit.
+Root column generation on an Apple M3 Pro, Julia 1.12, Vertigo.jl 8c1058d.
+The three formulations give the same root LP value, to within 1e-11.
 
-| Instance | Items | Capacity | Root LP | Bins ≥ | BPPLIB optimum | Time per formulation |
-|---|---|---|---|---|---|---|
-| Falkenauer_t60_00 | 60 | 1000 | 20.0 | 20 | 20 | about 50 s |
-| Falkenauer_u120_00 | 120 | 150 | 47.266 | 48 | 48 | about 130 s |
-| Falkenauer_t120_00 | 120 | 1000 | 40.0 | 40 | 40 | about 125 s |
-| Falkenauer_u250_00 | 250 | 150 | 98.553 | 99 | 99 | about 125 s |
+| Instance | Items | Capacity | Root LP | Bins ≥ | BPPLIB optimum | Compact | Patterns | By hand |
+|---|---|---|---|---|---|---|---|---|
+| Falkenauer_t60_00 | 60 | 1000 | 20.0 | 20 | 20 | 57 s | 45 s | 44 s |
+| Falkenauer_u120_00 | 120 | 150 | 47.266 | 48 | 48 | 86 s | 87 s | 86 s |
+
+Two larger instances were run with the pattern and hand-built formulations
+only, before the compact one existed: Falkenauer_t120_00 (root LP 40.0,
+optimum 40) and Falkenauer_u250_00 (root LP 98.553, optimum 99), in about
+125 s each.
 
 On these instances, the root bound rounded up already reaches the optimum.
 
@@ -106,16 +143,18 @@ julia --project=. tools/reference.jl instances/Falkenauer_u120_00.txt 18      # 
 julia --project=. tools/reference.jl instances/Falkenauer_u120_00.txt 14 5    # infeasible
 ```
 
-`binpacking.jl` with the same `--items` and `--bins` gives the same LP values,
-and `master_infeasible` for the last one.
+`binpacking.jl` with the same `--items` and `--bins` gives the same LP values
+with the three formulations, and `master_infeasible` for the last one.
 
 ## Known limits
 
 | What | Why | Tracked in |
 |---|---|---|
-| Only the root is solved | A pattern master has no original variables. Branch-and-price would close nodes as integral without branching, so it would not prove optimality. | Vertigo.jl#128 |
-| A bin must cost less than an artificial variable (10000) | Phase 1 adds the fixed cost to reduced costs; with a larger cost, column generation ends `master_infeasible` | Vertigo.jl#126 |
+| Only the root is solved | Branch-and-price would close nodes as integral without branching. In the compact formulation, `x[k̂, i]` is always 1, so the projection is integral while the columns are fractional; a pattern master has no original variables at all. | Vertigo.jl#128 |
+| Patterns and by hand: a bin must cost less than an artificial variable (10000) | There the cost of a bin is a fixed cost, which Phase 1 adds to reduced costs; with a larger cost, column generation ends `master_infeasible`. The compact formulation pays it through `y[k̂]` instead. | Vertigo.jl#126 |
 | Several profiles: one without a feasible pattern stops column generation | Even with a lower bound of 0 on its number of bins | Vertigo.jl#127 |
+| `apply_multiplicities!` writes into Vertigo's decomposition | The DML gives every subproblem the convexity bounds `(1, 1)` | Vertigo.jl#137, #84 |
+| The compact objective is written `sum(1.0 * y[k] for k in K)` | With one element in `K`, `sum(y[k] for k in K)` is a single variable; the DML keeps it as is, and column generation cannot modify such an objective | Vertigo.jl#137 |
 | The pattern layer accepts only some masters | Minimisation only, no constant in the objective, no master variable other than the columns, at most one lower and one upper convexity row per family. `Int` on `λ` is not used at the root. | Vertigo.jl#124 |
 | HiGHS is pinned to 1.24 | HiGHS.jl 1.27.0 reports wrong MIP objective values, and pricing reads them as reduced costs | guimarqu/VertigoCVRPDemo#1 |
 | Pricing is a HiGHS MIP solved at every iteration | No dedicated knapsack algorithm, so the larger instances take minutes | — |

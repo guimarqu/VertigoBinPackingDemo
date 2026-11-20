@@ -3,6 +3,7 @@ using HiGHS
 using Vertigo
 import MathOptInterface as MOI
 
+include("identical.jl")
 include("patterns.jl")
 
 # ── Instance ──────────────────────────────────────────────────────────────────
@@ -27,6 +28,39 @@ function parse_bpp(path::AbstractString; items::Union{Nothing,Int}=nothing)
     weights = values[3:(2 + n)]
     keep = items === nothing ? (1:n) : round.(Int, range(1, n; length=items))
     return BinPackingInstance(first(splitext(basename(path))), capacity, weights[keep])
+end
+
+# ── Compact formulation with identical bins ───────────────────────────────────
+
+"""
+    compact_decomposition(inst, nb_bins) -> DWReformulation
+
+The compact model of one representative bin, `K = identical(:bins, nb_bins)`,
+decomposed by the DML: `x[k, i]` puts item `i` in the bin, `y[k]` opens it.
+The one subproblem stands for up to `nb_bins` bins.
+"""
+function compact_decomposition(inst::BinPackingInstance, nb_bins::Int)
+    items = eachindex(inst.weights)
+    K = identical(:bins, nb_bins)
+
+    model = Model(HiGHS.Optimizer)
+    @variable(model, x[k in K, i in items], Bin)
+    @variable(model, y[k in K], Bin)
+    @constraint(model, knapsack[k in K], sum(inst.weights[i] * x[k, i] for i in items) <= inst.capacity * y[k])
+    @constraint(model, cover[i in items], sum(x[k, i] for k in K) >= 1)
+    # With one element in K, sum(y[k] for k in K) is the variable y[k] itself:
+    # the DML would copy a single-variable objective, which column generation
+    # cannot modify (Vertigo.jl#137). The 1.0 keeps an AffExpr.
+    @objective(model, Min, sum(1.0 * y[k] for k in K))
+
+    decomp, sp_map = @dantzig_wolfe model begin
+        x[k, _] => subproblem(k)
+        y[k] => subproblem(k)
+        knapsack[k] => subproblem(k)
+        cover[_] => master()
+    end
+    apply_multiplicities!(decomp, sp_map)
+    return decomp
 end
 
 # ── Pattern formulation ───────────────────────────────────────────────────────
@@ -181,14 +215,17 @@ function (@main)(args)
 
     profile = BinProfile(inst.capacity, nb_bins, inst.weights)
     master = pattern_master([profile], eachindex(inst.weights))
-    from_patterns = solve_root(compile_master(master, HiGHS.Optimizer); log=opts["log"])
-    by_hand = solve_root(hand_built_decomposition(inst, nb_bins); log=opts["log"])
-
-    report("patterns", from_patterns...)
-    report("by hand", by_hand...)
-    lp_patterns, lp_hand = from_patterns[1].master_lp_obj, by_hand[1].master_lp_obj
-    if lp_patterns !== nothing && lp_hand !== nothing && abs(lp_patterns - lp_hand) > 1e-6
-        println("the two formulations disagree")
+    results = [
+        "compact" => solve_root(compact_decomposition(inst, nb_bins); log=opts["log"]),
+        "patterns" => solve_root(compile_master(master, HiGHS.Optimizer); log=opts["log"]),
+        "by hand" => solve_root(hand_built_decomposition(inst, nb_bins); log=opts["log"]),
+    ]
+    for (label, (out, elapsed)) in results
+        report(label, out, elapsed)
+    end
+    lps = [out.master_lp_obj for (_, (out, _)) in results]
+    if any(isnothing, lps) ? !all(isnothing, lps) : maximum(lps) - minimum(lps) > 1e-6
+        println("the formulations disagree")
         return 1
     end
     return 0
